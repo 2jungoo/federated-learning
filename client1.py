@@ -13,10 +13,12 @@ from collections import OrderedDict
 import warnings
 import select
 import os
+import copy
 from torchvision import models
 import torchvision.transforms.v2 as v2
 
 warnings.filterwarnings("ignore")
+
 
 ############################################## 수정 금지 1 ##############################################
 IMG_SIZE = 192
@@ -26,102 +28,112 @@ DATASET_NAME = "./dataset/client1.pt"
 
 
 ############################################# 수정 가능 #############################################
-local_epochs = 3
+local_epochs = 5
 lr = 0.003
-batch_size = 16
+batch_size = 32
 host_ip = "127.0.0.1"
 port = 8081
-mu = 0.001
 
-################# 전처리 코드 #################
+# 강한 데이터 증강 (Label 1 데이터 활용 극대화)
 train_transform = v2.Compose([
-    v2.Resize(224),                      
-    v2.RandomCrop(IMG_SIZE),           
-    v2.RandomHorizontalFlip(),         
-    v2.RandomRotation(7),              
-    v2.ColorJitter(brightness=0.15, contrast=0.15),
+    v2.Resize(224, antialias=True),
+    v2.RandomResizedCrop(IMG_SIZE, scale=(0.75, 1.0), antialias=True),
+    v2.RandomHorizontalFlip(p=0.5),
+    v2.RandomRotation(degrees=15),
+    v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+    v2.RandomAffine(degrees=0, translate=(0.1, 0.1)),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406],
                  std=[0.229, 0.224, 0.225]),
 ])
-
-class Network1(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
+class MobileNetTiny(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES, width_mult=0.35):
         super().__init__()
+        # 기본 MobileNetV3-small 불러오기
+        base = models.mobilenet_v3_small(weights=None)
 
-        self.backbone = models.mobilenet_v2(pretrained=False)
-        in_features = self.backbone.classifier[1].in_features
+        # width multiplier 적용
+        def wm(ch): return max(int(ch * width_mult), 1)
 
-        self.backbone.classifier = nn.Sequential(
-            nn.Dropout(p=0.25),
-            nn.Linear(in_features, num_classes)
-        )
+        # 첫 Conv 레이어 축소
+        base.features[0][0].out_channels = wm(16)
 
-        nn.init.xavier_normal_(self.backbone.classifier[1].weight)
+        # 중간 레이어 채널 축소
+        for block in base.features:
+            if hasattr(block, "block"):
+                # expand, out 둘 다 줄임
+                if hasattr(block.block[0], "in_channels"):
+                    block.block[0].in_channels = wm(block.block[0].in_channels)
+                if hasattr(block.block[-1], "out_channels"):
+                    block.block[-1].out_channels = wm(block.block[-1].out_channels)
+
+        # 마지막 단계 축소
+        last_channels = wm(576)
+        base.classifier[0] = nn.Linear(last_channels, wm(128))
+        base.classifier[3] = nn.Linear(wm(128), num_classes)
+
+        self.model = base
 
     def forward(self, x):
-        return self.backbone(x)
+        return self.model(x)
 
-def train(model, criterion, optimizer, train_loader):   
 
+
+def train(model, criterion, optimizer, train_loader):
     model.to(device)
-
-    global_params = {
-        name: param.clone().detach()
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    }
+    model.train()
 
     for epoch in range(local_epochs):
         running_corrects = 0
         running_loss = 0.0
         total = 0
+        
+        # 클래스별 통계
+        class_loss = [0.0] * NUM_CLASSES
+        class_count = [0] * NUM_CLASSES
 
-        for (images, labels) in tqdm(train_loader, desc=f"Train (FedProx, epoch {epoch+1})"):
+        for (images, labels) in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
             images = images.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
             outputs = model(images)
-
-            
             loss = criterion(outputs, labels)
-
-            prox_reg = 0.0
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-
-                    prox_reg = prox_reg + ((param - global_params[name]) ** 2).sum()
-
-            loss = loss + (mu / 2.0) * prox_reg
-
+            
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             running_loss += loss.item()
-
             _, preds = torch.max(outputs, 1)
             running_corrects += torch.sum(preds == labels.data)
             total += labels.size(0)
+            
+            # 클래스별 통계 수집
+            for i in range(len(labels)):
+                label_idx = labels[i].item()
+                class_count[label_idx] += 1
+                class_loss[label_idx] += loss.item()
 
         epoch_loss = running_loss / len(train_loader)
-        epoch_accuracy = (running_corrects.double() / total) * 100.0
+        epoch_accuracy = running_corrects.double() / total
 
-        print(f"[FedProx] Epoch [{epoch + 1}/{local_epochs}] "
-              f"=> Train Loss: {epoch_loss:.4f} | Train Accuracy: {epoch_accuracy:.2f}%")
-
+        print(f"Epoch [{epoch + 1}/{local_epochs}] => Train Loss: {epoch_loss:.4f} | Train Accuracy: {epoch_accuracy * 100:.2f}%")
+        
+        # Label 1 학습 상태 모니터링
+        if class_count[1] > 0:
+            print(f"  -> Label 1: {class_count[1]} samples, Avg Loss: {class_loss[1]/class_count[1]:.4f}")
+    
     return model
 
-
 ##############################################################################################################################
-
 
 
 ####################################################### 수정 가능 ##############################################################
 
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
-        blob = torch.load(pt_path, map_location="cpu")
+        blob = torch.load(pt_path, map_location="cpu", weights_only=False)
         self.items = blob["items"]
         self.is_train = is_train
         self.transform = transform
@@ -131,35 +143,37 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx: int):
         rec = self.items[idx]
-        x = rec["tensor"].float() / 255.0      
+        x = rec["tensor"].float() / 255.0
         y = int(rec["label"])
-
         x = self.transform(x)
-
         return x, y
 
-
 def main():
-
     train_dataset = CustomDataset(DATASET_NAME, is_train=True, transform=train_transform)
-    num_workers = max(2, (os.cpu_count() or 8) - 2)
+    num_workers = min(4, os.cpu_count() or 4)
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
+        train_dataset, 
+        batch_size=batch_size, 
         shuffle=True,
+        num_workers=num_workers, 
         pin_memory=True,
-
+        prefetch_factor=2, 
+        persistent_workers=True,
+        drop_last=True
     )
 
-    model = Network1().to(device)
+    model = MobileNetTiny().to(device)
 
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-    criterion = torch.nn.CrossEntropyLoss()
+    # Label 1에 훨씬 더 높은 가중치 부여 (Client1이 Label 1을 완전히 책임짐)
+    class_weights = torch.tensor([1.0, 3.5, 1.0, 1.0]).to(device)
+    
+    global_round = 20
+    
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=global_round)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 ##############################################################################################################################
-
-
-
 
 
 ########################################################### 수정 금지 2 ##############################################################

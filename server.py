@@ -16,7 +16,6 @@ import os
 from torchvision import models
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
-
 warnings.filterwarnings("ignore")
 
 ############################################## 수정 불가 1 ##############################################
@@ -26,49 +25,58 @@ DATASET_NAME = "./dataset/test.pt"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
-# 연합학습 하이퍼파라미터 (제출용 튜닝 버전)
-target_accuracy = 92.0   # 목표 정확도
-global_round = 15        # 전체 글로벌 라운드 수
-batch_size = 16          # 평가 시 배치 크기
-num_samples = 512        # (현재는 사용하지 않지만, 부분 샘플링 방식 사용 시 활용 가능)
-
-host = '127.0.0.1'       # loop back으로 연합학습 수행 시 사용될 ip
-port = 8081              # 1024번 ~ 65535번
-
+target_accuracy = 98.0
+global_round = 9
+batch_size = 64
+num_samples = 1280
+host = '127.0.0.1'
+port = 8081
 
 test_transform = v2.Compose([
-    v2.Resize(256, antialias=True),
-    v2.CenterCrop(IMG_SIZE),  # network에 들어갈 image shape은 꼭 192 x 192로
+    v2.Resize(224, antialias=True),
+    v2.CenterCrop(IMG_SIZE),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406],
                  std=[0.229, 0.224, 0.225]),
 ])
 
-
-class Network1(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
+class MobileNetTiny(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES, width_mult=0.35):
         super().__init__()
+        # 기본 MobileNetV3-small 불러오기
+        base = models.mobilenet_v3_small(weights=None)
 
-        
-        self.backbone = models.mobilenet_v2(pretrained=False)
-        in_features = self.backbone.classifier[1].in_features
+        # width multiplier 적용
+        def wm(ch): return max(int(ch * width_mult), 1)
 
-        self.backbone.classifier = nn.Sequential(
-            nn.Dropout(p=0.25),
-            nn.Linear(in_features, num_classes)
-        )
+        # 첫 Conv 레이어 축소
+        base.features[0][0].out_channels = wm(16)
 
-        nn.init.xavier_normal_(self.backbone.classifier[1].weight)
+        # 중간 레이어 채널 축소
+        for block in base.features:
+            if hasattr(block, "block"):
+                # expand, out 둘 다 줄임
+                if hasattr(block.block[0], "in_channels"):
+                    block.block[0].in_channels = wm(block.block[0].in_channels)
+                if hasattr(block.block[-1], "out_channels"):
+                    block.block[-1].out_channels = wm(block.block[-1].out_channels)
+
+        # 마지막 단계 축소
+        last_channels = wm(576)
+        base.classifier[0] = nn.Linear(last_channels, wm(128))
+        base.classifier[3] = nn.Linear(wm(128), num_classes)
+
+        self.model = base
 
     def forward(self, x):
-        return self.backbone(x)
+        return self.model(x)
 
 
 
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
         print(pt_path)
-        blob = torch.load(pt_path, map_location="cpu")
+        blob = torch.load(pt_path, map_location="cpu", weights_only=False)
         self.items = blob["items"]
         self.is_train = is_train
         self.transform = transform
@@ -78,17 +86,14 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx: int):
         rec = self.items[idx]
-        x = rec["tensor"].float() / 255.0      
+        x = rec["tensor"].float() / 255.0
         y = int(rec["label"])
-
         x = self.transform(x)
-
         return x, y
 
 
-def measure_accuracy(global_model, test_loader): 
-
-    model = Network1().to(device)
+def measure_accuracy(global_model, test_loader):
+    model = MobileNetTiny().to(device)
     model.load_state_dict(global_model)
     model.to(device)
     model.eval()
@@ -96,6 +101,9 @@ def measure_accuracy(global_model, test_loader):
     accuracy = 0.0
     total = 0.0
     correct = 0
+    
+    class_correct = [0] * NUM_CLASSES
+    class_total = [0] * NUM_CLASSES
 
     inference_start = time.time()
     with torch.no_grad():
@@ -103,21 +111,52 @@ def measure_accuracy(global_model, test_loader):
         for inputs, labels in tqdm(test_loader, desc="Test"):
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             outputs = model(inputs)
-
-            correct += (outputs.argmax(1) == labels).sum().item()
+            preds = outputs.argmax(1)
+            correct += (preds == labels).sum().item()
             total += labels.size(0)
+            
+            for i in range(len(labels)):
+                label = labels[i].item()
+                class_total[label] += 1
+                if preds[i] == labels[i]:
+                    class_correct[label] += 1
 
         accuracy = (100 * correct / total)
+    
+    print("클래스별 정확도:")
+    for i in range(NUM_CLASSES):
+        if class_total[i] > 0:
+            print(f"  Label {i}: {100 * class_correct[i] / class_total[i]:.2f}%")
 
     inference_end = time.time()
     inference_time = inference_end - inference_start
 
     return accuracy, model, inference_time
+
+
+def get_model_size(global_model):
+    model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
+    model_size = model_size / (1024 ** 2)
+    return model_size
+
+
+def get_random_subset(dataset, num_samples):
+    if num_samples > len(dataset):
+        raise ValueError(f"num_samples should not exceed {len(dataset)} (total number of samples in test dataset).")
+    indices = random.sample(range(len(dataset)), num_samples)
+    subset = Subset(dataset, indices)
+    return subset
+
+
+def average_models(models):
+    weight_avg = copy.deepcopy(models[0])
+    for key in weight_avg.keys():
+        for i in range(1, len(models)):
+            weight_avg[key] += models[i][key]
+        weight_avg[key] = torch.div(weight_avg[key], len(models))
+    return weight_avg
+
 ##############################################################################################################################
-
-
-
-
 
 
 ####################################################### 수정 금지 ##############################################################
@@ -131,16 +170,15 @@ global_accuracy = 0.0
 current_round = 0
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-
 def handle_client(conn, addr, model, test_loader):
     global model_list, global_model, global_accuracy, global_model_size, current_round, cnt
     print(f"Connected by {addr}")
 
     while True:
         if len(cnt) < 2:
-            time.sleep(0.3)  # ★★★ 클라이언트가 recv 준비하도록 딜레이
             cnt.append(1)
             weight = pickle.dumps(dict(model.state_dict().items()))
+            # print(weight)
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
@@ -153,12 +191,12 @@ def handle_client(conn, addr, model, test_loader):
         model = pickle.loads(received_payload)
 
         model_list.append(model)
-
+        # print(models)
         if len(model_list) == 2:
             current_round += 1
             global_model = average_models(model_list)
             global_accuracy, global_model, _ = measure_accuracy(global_model, test_loader)
-            print(f"Global round [{current_round} / {global_round}] Accuracy : {global_accuracy:.2f}%")
+            print(f"Global round [{current_round} / {global_round}] Accuracy : {global_accuracy}%")
             global_model_size = get_model_size(global_model)
             model_list = []
             semaphore.release()
@@ -176,10 +214,10 @@ def handle_client(conn, addr, model, test_loader):
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
-
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
     model_size = model_size / (1024 ** 2)
+
     return model_size
 
 
@@ -191,7 +229,6 @@ def get_random_subset(dataset, num_samples):
     subset = Subset(dataset, indices)
 
     return subset
-
 
 def average_models(models):
     weight_avg = copy.deepcopy(models[0])
@@ -213,17 +250,20 @@ def main():
 
     ############################ 수정 가능 ############################
     train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
-
-    num_workers = max(2, (os.cpu_count() or 8) - 2)
+    num_workers = min(4, os.cpu_count() or 4)
 
     test_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
+        train_dataset, 
+        batch_size=batch_size, 
         shuffle=False,
-        pin_memory=True
+        num_workers=num_workers, 
+        pin_memory=True,
+        prefetch_factor=2, 
+        persistent_workers=True
     )
 
-    model = Network1().to(device)
+    model = MobileNetTiny().to(device)
+
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")
@@ -238,29 +278,20 @@ def main():
     connection1 = threading.Thread(target=handle_client, args=(connection[0], address[0], model, test_loader))
     connection2 = threading.Thread(target=handle_client, args=(connection[1], address[1], model, test_loader))
 
-    connection1.start()
-    connection2.start()
-    connection1.join()
-    connection2.join()
+    connection1.start();connection2.start()
+    connection1.join();connection2.join()
 
     training_end = time.time()
     total_time = training_end - training_start
 
-    # 평가지표 1
     print(f"\n학습 성능 : {global_accuracy:.2f} %")
-    # 평가지표 2
     print(f"\n학습 소요 시간: {int(total_time // 3600)} 시간 {int((total_time % 3600) // 60)} 분 {(total_time % 60):.2f} 초")
-
-    # 평가지표 3
     print(f"\n최종 모델 크기: {global_model_size:.4f} MB")
 
     final_model = dict(global_model.state_dict().items())
     _, _, inference_time = measure_accuracy(final_model, test_loader)
-    # 평가지표 4
     print(f"\n예측 소요 시간 : {(inference_time):.2f} 초")
-
     print("연합학습 종료")
-
 
 if __name__ == "__main__":
     main()
