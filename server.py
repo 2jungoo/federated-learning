@@ -26,7 +26,7 @@ DATASET_NAME = "./dataset/test.pt"
 
 ####################################################### 수정 가능 #######################################################
 target_accuracy = 98.0
-global_round = 15
+global_round = 9
 batch_size = 64
 num_samples = 1280
 host = '127.0.0.1'
@@ -40,36 +40,37 @@ test_transform = v2.Compose([
                  std=[0.229, 0.224, 0.225]),
 ])
 
-# MobileNetV3-Small 기반 모델
-class MobileNetSmall(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
+class MobileNetTiny(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES, width_mult=0.35):
         super().__init__()
-        self.backbone = models.mobilenet_v3_small(weights=None)
-        
-        in_features = self.backbone.classifier[0].in_features
-        self.backbone.classifier = nn.Sequential(
-            nn.Linear(in_features, 256),
-            nn.Hardswish(inplace=True),
-            nn.Dropout(p=0.2, inplace=True),
-            nn.Linear(256, num_classes),
-        )
-        
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
+        # 기본 MobileNetV3-small 불러오기
+        base = models.mobilenet_v3_small(weights=None)
+
+        # width multiplier 적용
+        def wm(ch): return max(int(ch * width_mult), 1)
+
+        # 첫 Conv 레이어 축소
+        base.features[0][0].out_channels = wm(16)
+
+        # 중간 레이어 채널 축소
+        for block in base.features:
+            if hasattr(block, "block"):
+                # expand, out 둘 다 줄임
+                if hasattr(block.block[0], "in_channels"):
+                    block.block[0].in_channels = wm(block.block[0].in_channels)
+                if hasattr(block.block[-1], "out_channels"):
+                    block.block[-1].out_channels = wm(block.block[-1].out_channels)
+
+        # 마지막 단계 축소
+        last_channels = wm(576)
+        base.classifier[0] = nn.Linear(last_channels, wm(128))
+        base.classifier[3] = nn.Linear(wm(128), num_classes)
+
+        self.model = base
+
     def forward(self, x):
-        return self.backbone(x)
+        return self.model(x)
+
 
 
 class CustomDataset(Dataset):
@@ -92,7 +93,7 @@ class CustomDataset(Dataset):
 
 
 def measure_accuracy(global_model, test_loader):
-    model = MobileNetSmall().to(device)
+    model = MobileNetTiny().to(device)
     model.load_state_dict(global_model)
     model.to(device)
     model.eval()
@@ -261,7 +262,8 @@ def main():
         persistent_workers=True
     )
 
-    model = MobileNetSmall().to(device)
+    model = MobileNetTiny().to(device)
+
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")
