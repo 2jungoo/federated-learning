@@ -35,7 +35,7 @@ port = 8081
 
 ################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함 #################
 train_transform = v2.Compose([
-    v2.Resize((64, 64), antialias=True),
+    v2.Resize((192, 192), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -129,7 +129,7 @@ class CustomDataset(Dataset):
         self.data = []
 
         pre_process = v2.Compose([
-            v2.Resize((64, 64), antialias=True),
+            v2.Resize((192, 192), antialias=True),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
