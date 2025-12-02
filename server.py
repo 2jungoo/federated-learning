@@ -33,7 +33,7 @@ port = 8081
 
 # [속도] 64x64 리사이즈
 test_transform = v2.Compose([
-    v2.Resize((64, 64), antialias=True),
+    v2.Resize((192, 192), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -101,7 +101,7 @@ class CustomDataset(Dataset):
         self.data = []
 
         pre_process = v2.Compose([
-            v2.Resize((64, 64), antialias=True),
+            v2.Resize((192, 192), antialias=True),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
