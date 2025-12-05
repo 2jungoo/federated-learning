@@ -1,4 +1,4 @@
-#수정 후 
+# 수정후 (인선님)
 import socket
 import pickle
 from tqdm import tqdm
@@ -8,7 +8,7 @@ from torch.utils.data import Subset
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset
 import struct
 from collections import OrderedDict
 import warnings
@@ -23,17 +23,16 @@ warnings.filterwarnings("ignore")
 ############################################## 수정 금지 1 ##############################################
 IMG_SIZE = 192
 NUM_CLASSES = 4
-DATASET_NAME = "./dataset/client1.pt"
+DATASET_NAME = "./dataset/client2.pt"
 ######################################################################################################
 
 ############################################# 수정 가능 #############################################
-local_epochs = 4
-lr = 0.005
+local_epochs = 2
+lr = 0.002
 batch_size = 128
 host_ip = "127.0.0.1"
 port = 8081
 
-# [더미] RAM Caching을 사용하므로 실제로는 CustomDataset 내부 로직이 중요함
 train_transform = v2.Compose([
     v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
@@ -45,21 +44,21 @@ class Network1(nn.Module):
     def __init__(self, num_classes=4):
         super(Network1, self).__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1),  # 192 -> 96
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),
             nn.BatchNorm2d(16), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 48
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(16, 32, 3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 24
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 12
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 6
+            nn.MaxPool2d(2, 2),
         )
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
@@ -88,7 +87,7 @@ def train(model, criterion, optimizer, train_loader):
         running_loss = 0.0
         total = 0
 
-        for (images, labels) in tqdm(train_loader, desc=f"Client1 Ep {epoch + 1}", leave=False):
+        for (images, labels) in tqdm(train_loader, desc=f"Client2 Ep {epoch + 1}", leave=False):
             images = images.to(device)
             labels = labels.to(device)
 
@@ -98,6 +97,13 @@ def train(model, criterion, optimizer, train_loader):
                 loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
+
+            # [Gradient Masking] Label 1 보호 (Linear는 classifier[2])
+            if model.classifier[2].weight.grad is not None:
+                model.classifier[2].weight.grad[1, :] = 0.0
+            if model.classifier[2].bias.grad is not None:
+                model.classifier[2].bias.grad[1] = 0.0
+
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -110,7 +116,6 @@ def train(model, criterion, optimizer, train_loader):
     return model
 
 
-# [속도 핵심] RAM Caching Dataset
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
         print(f"Loading & Caching {pt_path}...")
@@ -118,8 +123,6 @@ class CustomDataset(Dataset):
         items = blob["items"]
 
         self.data = []
-        self.labels = []
-
         pre_process = v2.Compose([
             v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
             v2.ToDtype(torch.float32, scale=True),
@@ -131,7 +134,6 @@ class CustomDataset(Dataset):
             img = pre_process(img)
             label = int(item["label"])
             self.data.append((img, label))
-            self.labels.append(label)
 
         self.augment = v2.RandomHorizontalFlip(p=0.5) if is_train else None
 
@@ -149,13 +151,7 @@ def main():
     train_dataset = CustomDataset(DATASET_NAME, is_train=True)
     num_workers = 0
 
-    class_counts = [422, 1339, 489, 606]
-    weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
-    sample_weights = [weights[label] for label in train_dataset.labels]
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
-                                               sampler=sampler,
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                                num_workers=num_workers, pin_memory=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
