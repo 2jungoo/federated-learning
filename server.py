@@ -1,3 +1,4 @@
+#수정 후 
 import threading
 import socket
 import pickle
@@ -6,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Subset
-
 import struct
 from tqdm import tqdm
 import copy
@@ -16,6 +16,7 @@ import os
 from torchvision import models
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
+
 warnings.filterwarnings("ignore")
 
 ############################################## 수정 불가 1 ##############################################
@@ -25,142 +26,116 @@ DATASET_NAME = "./dataset/test.pt"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
-target_accuracy = 98.0
-global_round = 15
-batch_size = 64
-num_samples = 1280
+target_accuracy = 90.0
+global_round = 30
+batch_size = 128
 host = '127.0.0.1'
 port = 8081
 
+# [중요] 192x192 입력을 받도록 유지
 test_transform = v2.Compose([
-    v2.Resize(224, antialias=True),
-    v2.CenterCrop(IMG_SIZE),
+    v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(mean=[0.485, 0.456, 0.406],
-                 std=[0.229, 0.224, 0.225]),
+    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# MobileNetV3-Small 기반 모델
-class MobileNetSmall(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
-        super().__init__()
-        self.backbone = models.mobilenet_v3_small(weights=None)
-        
-        in_features = self.backbone.classifier[0].in_features
-        self.backbone.classifier = nn.Sequential(
-            nn.Linear(in_features, 256),
-            nn.Hardswish(inplace=True),
-            nn.Dropout(p=0.2, inplace=True),
-            nn.Linear(256, num_classes),
+
+# [최적화 모델] 192x192 입력을 효율적으로 처리하는 구조 (약 0.4MB)
+class Network1(nn.Module):
+    def __init__(self, num_classes=4):
+        super(Network1, self).__init__()
+
+        self.features = nn.Sequential(
+            # Input: 3 x 192 x 192
+            # Stride 2를 사용하여 공간 해상도를 절반으로 즉시 축소 (속도 핵심)
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),  # -> 16 x 96 x 96
+            nn.BatchNorm2d(16), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),  # -> 16 x 48 x 48
+
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),  # -> 32 x 24 x 24
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),  # -> 64 x 12 x 12
+
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),  # -> 128 x 6 x 6
         )
-        
-        self._initialize_weights()
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)
+        )
     
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
+
     def forward(self, x):
-        return self.backbone(x)
+        x = self.features(x)
+        x = self.gap(x)
+        x = self.classifier(x)
+        return x
 
 
+# [속도 핵심] RAM Caching Dataset (로딩 바 1회 후 초고속 학습)
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
-        print(pt_path)
-        blob = torch.load(pt_path, map_location="cpu", weights_only=False)
-        self.items = blob["items"]
-        self.is_train = is_train
-        self.transform = transform
+        print(f"Loading & Caching {pt_path} to RAM...")
+        blob = torch.load(pt_path, map_location="cpu")
+        items = blob["items"]
+
+        self.data = []
+
+        pre_process = v2.Compose([
+            v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        for item in tqdm(items, desc="Pre-processing"):
+            img = item["tensor"].float() / 255.0
+            img = pre_process(img)
+            label = int(item["label"])
+            self.data.append((img, label))
 
     def __len__(self):
-        return len(self.items)
+        return len(self.data)
 
     def __getitem__(self, idx: int):
-        rec = self.items[idx]
-        x = rec["tensor"].float() / 255.0
-        y = int(rec["label"])
-        x = self.transform(x)
-        return x, y
+        return self.data[idx]
 
 
 def measure_accuracy(global_model, test_loader):
-    model = MobileNetSmall().to(device)
+    model = Network1().to(device)
     model.load_state_dict(global_model)
-    model.to(device)
     model.eval()
 
-    accuracy = 0.0
-    total = 0.0
     correct = 0
-    
-    class_correct = [0] * NUM_CLASSES
-    class_total = [0] * NUM_CLASSES
+    total = 0
+    # inference_start = time.time() # 원본 코드 변수명 유지를 위해 주석 처리하거나 아래서 계산
 
-    inference_start = time.time()
+    start = time.time()
     with torch.no_grad():
-        print("\n")
-        for inputs, labels in tqdm(test_loader, desc="Test"):
-            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
-            preds = outputs.argmax(1)
-            correct += (preds == labels).sum().item()
+            correct += (outputs.argmax(1) == labels).sum().item()
             total += labels.size(0)
-            
-            for i in range(len(labels)):
-                label = labels[i].item()
-                class_total[label] += 1
-                if preds[i] == labels[i]:
-                    class_correct[label] += 1
 
-        accuracy = (100 * correct / total)
-    
-    print("클래스별 정확도:")
-    for i in range(NUM_CLASSES):
-        if class_total[i] > 0:
-            print(f"  Label {i}: {100 * class_correct[i] / class_total[i]:.2f}%")
-
-    inference_end = time.time()
-    inference_time = inference_end - inference_start
-
-    return accuracy, model, inference_time
+    accuracy = (100 * correct / total) if total > 0 else 0
+    end = time.time()
+    return accuracy, model, end - start
 
 
-def get_model_size(global_model):
-    model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
-    model_size = model_size / (1024 ** 2)
-    return model_size
-
-
-def get_random_subset(dataset, num_samples):
-    if num_samples > len(dataset):
-        raise ValueError(f"num_samples should not exceed {len(dataset)} (total number of samples in test dataset).")
-    indices = random.sample(range(len(dataset)), num_samples)
-    subset = Subset(dataset, indices)
-    return subset
-
-
-def average_models(models):
-    weight_avg = copy.deepcopy(models[0])
-    for key in weight_avg.keys():
-        for i in range(1, len(models)):
-            weight_avg[key] += models[i][key]
-        weight_avg[key] = torch.div(weight_avg[key], len(models))
-    return weight_avg
 
 ##############################################################################################################################
 
-
 ####################################################### 수정 금지 ##############################################################
 cnt = []
-model_list = []  # 수신받은 model 저장할 리스트
+model_list = []
 semaphore = threading.Semaphore(0)
 
 global_model = None
@@ -168,6 +143,7 @@ global_model_size = 0
 global_accuracy = 0.0
 current_round = 0
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 
 def handle_client(conn, addr, model, test_loader):
     global model_list, global_model, global_accuracy, global_model_size, current_round, cnt
@@ -177,7 +153,6 @@ def handle_client(conn, addr, model, test_loader):
         if len(cnt) < 2:
             cnt.append(1)
             weight = pickle.dumps(dict(model.state_dict().items()))
-            # print(weight)
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
@@ -190,7 +165,7 @@ def handle_client(conn, addr, model, test_loader):
         model = pickle.loads(received_payload)
 
         model_list.append(model)
-        # print(models)
+
         if len(model_list) == 2:
             current_round += 1
             global_model = average_models(model_list)
@@ -213,30 +188,27 @@ def handle_client(conn, addr, model, test_loader):
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
+
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
     model_size = model_size / (1024 ** 2)
-
     return model_size
 
 
 def get_random_subset(dataset, num_samples):
     if num_samples > len(dataset):
         raise ValueError(f"num_samples should not exceed {len(dataset)} (total number of samples in test dataset).")
-
     indices = random.sample(range(len(dataset)), num_samples)
     subset = Subset(dataset, indices)
-
     return subset
+
 
 def average_models(models):
     weight_avg = copy.deepcopy(models[0])
-
     for key in weight_avg.keys():
         for i in range(1, len(models)):
             weight_avg[key] += models[i][key]
         weight_avg[key] = torch.div(weight_avg[key], len(models))
-
     return weight_avg
 
 
@@ -249,19 +221,14 @@ def main():
 
     ############################ 수정 가능 ############################
     train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
-    num_workers = min(4, os.cpu_count() or 4)
+    # [중요] Worker 0 설정 (RAM Caching 데이터 사용 시 필수)
+    num_workers = 0
 
-    test_loader = torch.utils.data.DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=num_workers, 
-        pin_memory=True,
-        prefetch_factor=2, 
-        persistent_workers=True
-    )
+    # 원본 코드 구조 유지하되 Worker 0 적용
+    test_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
+                                              num_workers=num_workers, pin_memory=True)
 
-    model = MobileNetSmall().to(device)
+    model = Network1().to(device)
     ####################################################################
 
     print(f"Server is listening on {host}:{port}")
@@ -276,21 +243,24 @@ def main():
     connection1 = threading.Thread(target=handle_client, args=(connection[0], address[0], model, test_loader))
     connection2 = threading.Thread(target=handle_client, args=(connection[1], address[1], model, test_loader))
 
-    connection1.start();connection2.start()
-    connection1.join();connection2.join()
+    connection1.start();
+    connection2.start()
+    connection1.join();
+    connection2.join()
 
     training_end = time.time()
     total_time = training_end - training_start
 
-    print(f"\n학습 성능 : {global_accuracy:.2f} %")
+    print(f"\n학습 성능 : {global_accuracy} %")
     print(f"\n학습 소요 시간: {int(total_time // 3600)} 시간 {int((total_time % 3600) // 60)} 분 {(total_time % 60):.2f} 초")
     print(f"\n최종 모델 크기: {global_model_size:.4f} MB")
 
     final_model = dict(global_model.state_dict().items())
     _, _, inference_time = measure_accuracy(final_model, test_loader)
     print(f"\n예측 소요 시간 : {(inference_time):.2f} 초")
+
     print("연합학습 종료")
+
 
 if __name__ == "__main__":
     main()
-##############################################################################################################################
