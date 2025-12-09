@@ -42,22 +42,15 @@ class Network1(nn.Module):
         super(Network1, self).__init__()
 
         self.features = nn.Sequential(
-            # 192 -> 96 (Stride 2) -> 48 (Pool)
             nn.Conv2d(3, 16, 3, stride=2, padding=1),
             nn.BatchNorm2d(16), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
-
-            # 48 -> 24
             nn.Conv2d(16, 32, 3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
-
-            # 24 -> 12
             nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
-
-            # 12 -> 6
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
@@ -88,8 +81,6 @@ class Network1(nn.Module):
         x = self.classifier(x)
         return x
 
-
-# [속도 핵심] RAM Caching
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
         print(f"Loading & Caching {pt_path}...")
