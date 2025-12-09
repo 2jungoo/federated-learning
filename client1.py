@@ -19,6 +19,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 warnings.filterwarnings("ignore")
 
+
 ############################################## 수정 금지 1 ##############################################
 IMG_SIZE = 192
 NUM_CLASSES = 4
@@ -27,34 +28,37 @@ DATASET_NAME = "./dataset/client1.pt"
 
 
 ############################################# 수정 가능 #############################################
-local_epochs = 4  # Epoch 증가
+local_epochs = 4
 lr = 0.005
 batch_size = 128
 host_ip = "127.0.0.1"
 port = 8081
 
+
 ################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함 #################
-# RAM Caching을 사용하므로 여기서는 실제 사용되지 않음
 train_transform = v2.Compose([
-    v2.Resize((192, 192), antialias=True),
+    v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-
+## 아래는 예시 모델이며, 예시 모델 그대로 사용하여 제출하면 안됨
 class Network1(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
-        super().__init__()
+    def __init__(self, num_classes=4):
+        super(Network1, self).__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),
             nn.BatchNorm2d(16), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
+
             nn.Conv2d(16, 32, 3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
+
             nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
+
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
@@ -107,13 +111,14 @@ def train(model, criterion, optimizer, train_loader):
 
     return model
 
-
 ##############################################################################################################################
+
 
 
 ####################################################### 수정 가능 ##############################################################
 
-# [속도 핵심] RAM Caching Dataset
+
+
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
         print(f"Loading & Caching {pt_path}...")
@@ -121,10 +126,10 @@ class CustomDataset(Dataset):
         items = blob["items"]
 
         self.data = []
-        self.labels = []  # Sampler를 위해 라벨 따로 저장
+        self.labels = []
 
         pre_process = v2.Compose([
-            v2.Resize((192, 192), antialias=True),
+            v2.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
@@ -150,8 +155,6 @@ class CustomDataset(Dataset):
 
 def main():
     train_dataset = CustomDataset(DATASET_NAME, is_train=True)
-
-    # [중요] Worker 0 (RAM 데이터 즉시 사용)
     num_workers = 0
 
     class_counts = [422, 1339, 489, 606]
@@ -159,7 +162,6 @@ def main():
     sample_weights = [weights[label] for label in train_dataset.labels]
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
-    # [수정] prefetch_factor 제거
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
                                                sampler=sampler,
                                                num_workers=num_workers, pin_memory=True)
@@ -170,6 +172,10 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     ##############################################################################################################################
+
+
+
+
 
     ########################################################### 수정 금지 2 ##############################################################
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
