@@ -25,45 +25,42 @@ DATASET_NAME = "./dataset/test.pt"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
-target_accuracy = 95.0
+target_accuracy = 90.0
 global_round = 30
-batch_size = 128
+batch_size = 128  # 속도 향상
 host = '127.0.0.1'
 port = 8081
 
-# [속도] 64x64 리사이즈
 test_transform = v2.Compose([
     v2.Resize((192, 192), antialias=True),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-
-# [모델] 0.3MB급 Standard CNN
 class Network1(nn.Module):
     def __init__(self, num_classes=4):
         super(Network1, self).__init__()
 
         self.features = nn.Sequential(
-            # 1. 3 -> 16
-            nn.Conv2d(3, 16, 3, padding=1),
+            # 192 -> 96 (Stride 2) -> 48 (Pool)
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),
             nn.BatchNorm2d(16), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 32x32
+            nn.MaxPool2d(2, 2),
 
-            # 2. 16 -> 32
+            # 48 -> 24
             nn.Conv2d(16, 32, 3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 16x16
+            nn.MaxPool2d(2, 2),
 
-            # 3. 32 -> 64
+            # 24 -> 12
             nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 8x8
+            nn.MaxPool2d(2, 2),
 
-            # 4. 64 -> 128
+            # 12 -> 6
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # 4x4
+            nn.MaxPool2d(2, 2),
         )
 
         self.gap = nn.AdaptiveAvgPool2d(1)
@@ -72,6 +69,7 @@ class Network1(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(128, num_classes)
         )
+
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -91,7 +89,7 @@ class Network1(nn.Module):
         return x
 
 
-# [속도 핵심] RAM Caching Dataset
+# [속도 핵심] RAM Caching
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
         print(f"Loading & Caching {pt_path}...")
@@ -106,7 +104,7 @@ class CustomDataset(Dataset):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        for item in tqdm(items, desc="Pre-processing"):
+        for item in tqdm(items, desc="Caching"):
             img = item["tensor"].float() / 255.0
             img = pre_process(img)
             label = int(item["label"])
@@ -141,9 +139,14 @@ def measure_accuracy(global_model, test_loader):
 
 ##############################################################################################################################
 
+
+
+
+
+
 ####################################################### 수정 금지 ##############################################################
 cnt = []
-model_list = []  # 수신받은 model 저장할 리스트
+model_list = [] # 수신받은 model 저장할 리스트
 semaphore = threading.Semaphore(0)
 
 global_model = None
@@ -161,7 +164,6 @@ def handle_client(conn, addr, model, test_loader):
         if len(cnt) < 2:
             cnt.append(1)
             weight = pickle.dumps(dict(model.state_dict().items()))
-            # print(weight)
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
@@ -174,7 +176,6 @@ def handle_client(conn, addr, model, test_loader):
         model = pickle.loads(received_payload)
 
         model_list.append(model)
-        # print(models)
         if len(model_list) == 2:
             current_round += 1
             global_model = average_models(model_list)
@@ -201,28 +202,23 @@ def handle_client(conn, addr, model, test_loader):
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
     model_size = model_size / (1024 ** 2)
-
     return model_size
 
 
 def get_random_subset(dataset, num_samples):
     if num_samples > len(dataset):
         raise ValueError(f"num_samples should not exceed {len(dataset)} (total number of samples in test dataset).")
-
     indices = random.sample(range(len(dataset)), num_samples)
     subset = Subset(dataset, indices)
-
     return subset
 
 
 def average_models(models):
     weight_avg = copy.deepcopy(models[0])
-
     for key in weight_avg.keys():
         for i in range(1, len(models)):
             weight_avg[key] += models[i][key]
         weight_avg[key] = torch.div(weight_avg[key], len(models))
-
     return weight_avg
 
 
@@ -235,9 +231,7 @@ def main():
 
     ############################ 수정 가능 ############################
     train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
-    # [수정] Worker 0: RAM Caching된 데이터를 즉시 사용하므로 prefetch_factor 옵션 제거
     num_workers = 0
-
     test_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
                                               num_workers=num_workers, pin_memory=True)
 
@@ -256,14 +250,11 @@ def main():
     connection1 = threading.Thread(target=handle_client, args=(connection[0], address[0], model, test_loader))
     connection2 = threading.Thread(target=handle_client, args=(connection[1], address[1], model, test_loader))
 
-    connection1.start();
-    connection2.start()
-    connection1.join();
-    connection2.join()
+    connection1.start(); connection2.start()
+    connection1.join(); connection2.join()
 
     training_end = time.time()
     total_time = training_end - training_start
-
     # 평가지표 1
     print(f"\n학습 성능 : {global_accuracy} %")
     # 평가지표 2
@@ -281,4 +272,8 @@ def main():
 
 
 if __name__ == "__main__":
+
+
+
     main()
+##############################################################################################################################
