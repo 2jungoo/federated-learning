@@ -50,15 +50,12 @@ class Network1(nn.Module):
             nn.Conv2d(3, 16, 3, stride=2, padding=1),
             nn.BatchNorm2d(16), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
-
             nn.Conv2d(16, 32, 3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
-
             nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
-
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(True),
             nn.MaxPool2d(2, 2),
